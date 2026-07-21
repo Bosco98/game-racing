@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { OpenControl, type ControllerSession } from "@opencontrol/sdk";
+import { OpenControl, type ControllerSession } from "@bosco98/opencontrol-sdk";
 
 type Phase = "enter-code" | "joining" | "connected" | "reconnecting";
 

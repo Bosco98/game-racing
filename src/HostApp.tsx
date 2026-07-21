@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { OpenControl, type TiltEvents, type HostSession } from "@opencontrol/sdk";
+import { OpenControl, type TiltEvents, type HostSession } from "@bosco98/opencontrol-sdk";
 import QRCode from "qrcode";
 import { RacingGame, type LeaderboardRow } from "./game";
 

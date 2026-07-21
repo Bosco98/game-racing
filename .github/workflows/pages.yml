@@ -23,12 +23,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          registry-url: https://npm.pkg.github.com
+          scope: "@bosco98"
 
-      # The SDK is vendored as a tarball (vendor/*.tgz) — plain npm ci works.
-      # vite base "./" makes the build path-independent.
+      # @bosco98/opencontrol-sdk comes from GitHub Packages (published by the
+      # Opn-gamedeck repo). npm install (not ci) so the resolution happens
+      # against the registry with the CI token. vite base "./" keeps the build
+      # path-independent.
       - name: Build
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          npm ci
+          npm install
           npm run build
 
       - uses: actions/upload-pages-artifact@v3

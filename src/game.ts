@@ -1,4 +1,4 @@
-import type { TiltEvents, HostSession, Player } from "@opencontrol/sdk";
+import type { TiltEvents, HostSession, Player } from "@bosco98/opencontrol-sdk";
 
 /**
  * Racing game engine — pure game logic + canvas rendering.
