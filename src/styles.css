@@ -61,24 +61,57 @@ html, body, #root {
 .join-card .warn { margin-top: 10px; font-size: 12px; color: #ffb454; max-width: 340px; }
 .join-card .error { color: #ff5a5f; font-size: 14px; max-width: 340px; }
 
-.hud {
+/* Lobby player list inside the join card */
+.lobby-list {
+  list-style: none;
+  margin: 16px auto 0;
+  max-width: 320px;
+  text-align: left;
+  font-size: 14px;
+}
+.lobby-list li { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
+.lobby-list .swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+.lobby-list .ready { margin-left: auto; font-size: 11px; color: #6a7180; letter-spacing: 0.06em; }
+.lobby-list .ready.is-ready { color: #7ee787; font-weight: 800; }
+.lobby-list .ghost { opacity: 0.45; }
+
+/* Countdown */
+.countdown {
+  font-size: min(28vh, 30vw);
+  font-weight: 900;
+  color: #f0f6fc;
+  text-shadow: 0 8px 60px rgba(0, 0, 0, 0.8);
+  animation: countdown-pop 0.9s ease-out;
+}
+@keyframes countdown-pop {
+  0% { transform: scale(1.6); opacity: 0; }
+  25% { transform: scale(1); opacity: 1; }
+  100% { transform: scale(0.92); opacity: 0.9; }
+}
+
+/* Podium */
+.podium-list { list-style: none; margin: 18px 0 6px; text-align: left; font-size: 16px; }
+.podium-list li { display: flex; align-items: center; gap: 10px; padding: 7px 0; }
+.podium-list .place { width: 34px; text-align: center; font-size: 20px; }
+.podium-list .swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+.podium-list .time { margin-left: auto; padding-left: 28px; color: #9aa1af; font-variant-numeric: tabular-nums; }
+
+/* Small room-code chip while racing (top-right; pane HUDs own the top-left) */
+.race-chip {
   position: fixed;
-  top: 12px;
+  top: 10px;
   right: 12px;
-  min-width: 200px;
-  background: rgba(12, 14, 20, 0.78);
+  background: rgba(12, 14, 20, 0.72);
   border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 14px;
-  padding: 10px 14px;
+  border-radius: 999px;
+  padding: 5px 14px;
   font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: #7ee787;
   pointer-events: none;
 }
-.hud .hud-code { font-weight: 800; letter-spacing: 0.14em; color: #7ee787; margin-bottom: 6px; }
-.hud ol { list-style: none; }
-.hud li { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
-.hud .swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
-.hud .dist { margin-left: auto; color: #9aa1af; font-variant-numeric: tabular-nums; }
-.hud .ghost { opacity: 0.45; }
+.race-chip .waiting { color: #9aa1af; font-weight: 600; letter-spacing: normal; }
 
 /* ---- controller page ---- */
 .controller-root { position: fixed; inset: 0; }

@@ -1,7 +1,10 @@
 # Tilt Grand Prix — OpenControl racing
 
 React racing game where phones are the controllers: tilt to steer, triggers
-for gas/brake, A for nitro. Built on
+for gas/brake, A for nitro (and to ready up). Mario Kart-style split screen —
+each racer gets their own pseudo-3D chase camera on a shared seeded track
+(curves, hills, lane-changing traffic), racing 2000m to the finish line with
+countdown, podium, and rematch. Up to 4 racers. Built on
 [`@bosco98/opencontrol-sdk`](https://github.com/Bosco98/Opn-gamedeck),
 installed from GitHub Packages.
 
