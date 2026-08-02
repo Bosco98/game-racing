@@ -4,14 +4,20 @@
  * Everything here works in meters on the shared 1-D track from track.ts.
  * No rendering, no networking: race.ts owns the state and calls step()
  * every frame; render.ts draws whatever state is in here.
+ *
+ * Two drive models share the same car:
+ *   - Cruise: the original arcade model — gas, brake, nitro on A.
+ *   - Grand Prix: a 4-speed gearbox (`car.gearing` set). Each gear caps
+ *     speed and pulls differently; shifting near the redline is rewarded,
+ *     lugging a tall gear and money-shifting down are punished.
  */
 
 import {
+  type PickupSpawn,
   type Track,
   type TrafficSpawn,
   curveAt,
   mulberry32,
-  RACE_LENGTH,
   ROAD_HALF_W,
 } from "./track";
 
@@ -27,6 +33,40 @@ const RUBBER_BAND_MAX = 0.09;
 /** Centrifugal pull at full curve and full speed, m/s of lateral drift. */
 const CENTRIFUGAL = 11;
 
+/* ------------------------------------------------------------------ */
+/* Gearbox                                                             */
+/* ------------------------------------------------------------------ */
+
+export const GEAR_COUNT = 4;
+/** Top speed of each gear as a fraction of the car's effective top speed. */
+export const GEAR_TOP = [0.3, 0.52, 0.75, 1.0];
+/** Acceleration authority per gear — low gears pull much harder. */
+const GEAR_PULL = [2.0, 1.5, 1.15, 0.85];
+/** rpm at which an upshift counts as perfect (up to the limiter). */
+export const PERFECT_RPM = 0.82;
+/** rpm below which an upshift bogs the engine. */
+const BOG_RPM = 0.55;
+const PERFECT_BOOST_MS = 1000;
+const PERFECT_IMPULSE = 2.0; // m/s, instant
+/** Lugging a tall gear at low rpm barely pulls. */
+const LUG_RPM = 0.3;
+const LUG_FACTOR = 0.35;
+/** Money shift: braking force applied while over the new gear's cap. */
+const OVERREV_DECEL = 30;
+
+export interface Gearing {
+  gear: number; // 1-based
+  auto: boolean;
+  /** Perfect-shift boost active until this timestamp. */
+  perfectUntil: number;
+  /** Timestamp of the last shift, for renderer flashes. */
+  shiftedAt: number;
+  /** Result of the last shift, for renderer/haptics. */
+  lastShift: ShiftQuality | null;
+}
+
+export type ShiftQuality = "perfect" | "ok" | "bog" | "overrev";
+
 export interface CarState {
   /** Track position, meters. */
   d: number;
@@ -40,10 +80,13 @@ export interface CarState {
   nitroUntil: number;
   nitroReadyAt: number;
   invincibleUntil: number;
-  /** Set when the car crosses RACE_LENGTH; inputs are ignored after. */
+  /** Set when the car crosses the finish line; inputs are ignored after. */
   finished: boolean;
   /** Steering input frozen while true (disconnected player). */
   ghost: boolean;
+  /** Grand Prix gearbox; null = cruise drive model. */
+  gearing: Gearing | null;
+  coins: number;
 }
 
 export interface TrafficCar {
@@ -62,6 +105,14 @@ export interface TrafficCar {
   blinkDir: -1 | 0 | 1;
   nextThinkAt: number;
   rng: () => number;
+}
+
+export interface Pickup {
+  d: number;
+  x: number;
+  kind: "boost" | "coin";
+  /** Bitmask of pane indices that already collected this pickup. */
+  takenBy: number;
 }
 
 export interface StepCallbacks {
@@ -84,6 +135,8 @@ export function createCar(startX: number): CarState {
     invincibleUntil: 0,
     finished: false,
     ghost: false,
+    gearing: null,
+    coins: 0,
   };
 }
 
@@ -104,6 +157,10 @@ export function spawnTraffic(spawns: TrafficSpawn[]): TrafficCar[] {
   }));
 }
 
+export function spawnPickups(spawns: PickupSpawn[]): Pickup[] {
+  return spawns.map((s) => ({ d: s.d, x: s.x, kind: s.kind, takenBy: 0 }));
+}
+
 export function tryNitro(car: CarState, now: number): boolean {
   if (now < car.nitroReadyAt || car.ghost || car.finished) return false;
   car.nitroUntil = now + NITRO_DURATION_MS;
@@ -117,6 +174,96 @@ export function maxSpeedFor(car: CarState, now: number, leaderD: number): number
   const behind = Math.max(0, leaderD - car.d);
   const band = 1 + Math.min(RUBBER_BAND_MAX, (behind / 1200) * RUBBER_BAND_MAX * 4);
   return MAX_SPEED * nitro * band;
+}
+
+/** Engine rpm as 0..1 of the current gear's band. */
+export function rpmFor(car: CarState, now: number, leaderD: number): number {
+  if (!car.gearing) return car.speed / maxSpeedFor(car, now, leaderD);
+  const cap = GEAR_TOP[car.gearing.gear - 1] * maxSpeedFor(car, now, leaderD);
+  return Math.max(0, Math.min(1, car.speed / cap));
+}
+
+/**
+ * Manual gear select (also used by the auto-shifter). Grades the shift:
+ * upshifting from the redline is perfect and briefly boosts; upshifting
+ * from low revs bogs; downshifting far over the new cap is a money shift
+ * (the over-rev decel in stepCars does the punishing).
+ */
+export function shiftGear(car: CarState, gear: number, now: number, leaderD: number): ShiftQuality | null {
+  const g = car.gearing;
+  if (!g || car.finished || car.ghost) return null;
+  gear = Math.max(1, Math.min(GEAR_COUNT, Math.round(gear)));
+  if (gear === g.gear) return null;
+
+  const rpm = rpmFor(car, now, leaderD);
+  let quality: ShiftQuality;
+  if (gear > g.gear) {
+    quality = gear === g.gear + 1 && rpm >= PERFECT_RPM ? "perfect" : rpm < BOG_RPM ? "bog" : "ok";
+  } else {
+    const newCap = GEAR_TOP[gear - 1] * maxSpeedFor(car, now, leaderD);
+    quality = car.speed > newCap * 1.15 ? "overrev" : "ok";
+  }
+
+  g.gear = gear;
+  g.shiftedAt = now;
+  g.lastShift = quality;
+  if (quality === "perfect") {
+    g.perfectUntil = now + PERFECT_BOOST_MS;
+    car.speed += PERFECT_IMPULSE;
+  }
+  return quality;
+}
+
+/** Decent-but-never-perfect gearbox for AUTO players. */
+function autoShift(car: CarState, now: number, leaderD: number): void {
+  const g = car.gearing!;
+  const rpm = rpmFor(car, now, leaderD);
+  if (rpm > 0.9 && g.gear < GEAR_COUNT && car.gas > 0) {
+    g.gear += 1;
+    g.shiftedAt = now;
+    g.lastShift = "ok";
+  } else if (g.gear > 1) {
+    const lowerCap = GEAR_TOP[g.gear - 2] * maxSpeedFor(car, now, leaderD);
+    if (car.speed < lowerCap * 0.82) {
+      g.gear -= 1;
+      g.shiftedAt = now;
+      g.lastShift = "ok";
+    }
+  }
+}
+
+/** Grab an instant boost from a canister (no cooldown involved). */
+export function applyBoostPickup(car: CarState, now: number): void {
+  car.nitroUntil = Math.max(car.nitroUntil, now + 1100);
+}
+
+/**
+ * Collect pickups under `car` for the racer at pane `index`.
+ * Returns what was collected this frame (boost already applied).
+ */
+export function collectPickups(
+  car: CarState,
+  index: number,
+  pickups: Pickup[],
+  now: number,
+): { coins: number; boosts: number } {
+  const bit = 1 << index;
+  let coins = 0;
+  let boosts = 0;
+  for (const p of pickups) {
+    if (p.takenBy & bit) continue;
+    if (Math.abs(p.d - car.d) < 3.4 && Math.abs(p.x - car.x) < 1.7) {
+      p.takenBy |= bit;
+      if (p.kind === "coin") {
+        coins += 1;
+        car.coins += 1;
+      } else {
+        boosts += 1;
+        applyBoostPickup(car, now);
+      }
+    }
+  }
+  return { coins, boosts };
 }
 
 /* ------------------------------------------------------------------ */
@@ -182,6 +329,8 @@ export function stepCars(
     if (car.finished) {
       // Coast out past the line.
       car.speed = Math.max(0, car.speed - 18 * dt);
+    } else if (car.gearing) {
+      stepGeared(car, top, dt, now, leaderD);
     } else {
       const gas = car.ghost ? 0 : car.gas;
       const brake = car.ghost ? 0 : car.brake;
@@ -205,7 +354,7 @@ export function stepCars(
       car.speed *= 1 - 0.9 * dt;
     }
 
-    if (!car.finished && car.d >= RACE_LENGTH) {
+    if (!car.finished && car.d >= track.raceLength) {
       car.finished = true;
     }
 
@@ -219,6 +368,11 @@ export function stepCars(
           car.speed *= 0.3;
           car.nitroUntil = 0;
           car.invincibleUntil = now + 1400;
+          // A crash also drops the box down to where the speed now is.
+          if (car.gearing) {
+            car.gearing.gear = Math.max(1, car.gearing.gear - 2);
+            car.gearing.perfectUntil = 0;
+          }
           callbacks.onCrash(car);
           break;
         }
@@ -243,4 +397,28 @@ export function stepCars(
       }
     }
   }
+}
+
+/** One integration step of the Grand Prix drive model. */
+function stepGeared(car: CarState, top: number, dt: number, now: number, leaderD: number): void {
+  const g = car.gearing!;
+  if (g.auto && !car.ghost) autoShift(car, now, leaderD);
+
+  const cap = GEAR_TOP[g.gear - 1] * top;
+  const rpm = Math.max(0, Math.min(1, car.speed / cap));
+  const gas = car.ghost ? 0 : car.gas;
+  const brake = car.ghost ? 0 : car.brake;
+
+  let pull = GEAR_PULL[g.gear - 1];
+  if (g.gear > 1 && rpm < LUG_RPM) pull *= LUG_FACTOR; // lugging a tall gear
+  if (now < g.perfectUntil) pull *= 1.6; // perfect-shift surge
+
+  let accel = gas * 26 * pull - brake * 48 - 4.5;
+  if (car.speed > cap) {
+    // Money shift / crash-dropped gear: engine braking hauls you to the cap.
+    accel = Math.min(accel, -OVERREV_DECEL);
+    car.speed = Math.max(cap, car.speed + accel * dt);
+    return;
+  }
+  car.speed = Math.max(0, Math.min(cap, car.speed + accel * dt));
 }

@@ -6,29 +6,54 @@
  * 3 players quadrants + standings panel, 4 players quadrants.
  */
 
-import { type CarState, type TrafficCar, CAR_W, MAX_SPEED, NITRO_COOLDOWN_MS } from "./physics";
-import { type Track, RACE_LENGTH, ROAD_HALF_W, SEG_LEN, elevAt } from "./track";
+import {
+  type CarState,
+  type Pickup,
+  type TrafficCar,
+  CAR_W,
+  MAX_SPEED,
+  NITRO_COOLDOWN_MS,
+  PERFECT_RPM,
+} from "./physics";
+import {
+  type Track,
+  ENDLESS_CHECKPOINT_EVERY,
+  ROAD_HALF_W,
+  SEG_LEN,
+  elevAt,
+} from "./track";
 
 export type Phase = "lobby" | "countdown" | "racing" | "finished";
 
 export interface RenderPlayer {
   car: CarState;
+  /** Pane index — also the identity bit used by pickup collection. */
+  index: number;
   name: string;
   color: string;
   /** Current standing, 1-based. */
   place: number;
   finished: boolean;
   ghost: boolean;
+  /** Engine rpm 0..1 of the current gear band (Grand Prix). */
+  rpm: number;
+  busted: boolean;
+  /** Meters of buffer before the cop, or null off chase circuits. */
+  copGap: number | null;
 }
 
 export interface RenderState {
   track: Track;
   traffic: TrafficCar[];
+  pickups: Pickup[];
   players: RenderPlayer[];
   phase: Phase;
+  mode: "cruise" | "gp";
   now: number;
   /** Camera distance for the attract-mode camera when no players are in. */
   demoD: number;
+  /** Endless Rush clock, when that circuit is live. */
+  endless: { leftS: number; flashUntil: number; bonusS: number } | null;
 }
 
 interface Viewport {
@@ -58,10 +83,6 @@ const CAM_BEHIND = 13; // camera meters behind the car
 const CAM_HEIGHT = 3.4;
 const CURVE_SCALE = 0.055; // road bend accumulation, meters/segment²
 const NEAR_PLANE = 0.2;
-
-const SKY_TOP = "#0b1022";
-const SKY_HORIZON = "#b06a45";
-const FOG = { r: 27, g: 42, b: 74 };
 
 export class Renderer {
   private readonly ctx: CanvasRenderingContext2D;
@@ -110,7 +131,8 @@ export class Renderer {
 
     this.drawPaneBorders(panes);
     if (state.phase === "racing" || state.phase === "finished" || state.phase === "countdown") {
-      this.drawProgressStrip(state);
+      if (state.endless) this.drawEndlessClock(state);
+      else this.drawProgressStrip(state);
     }
   }
 
@@ -143,6 +165,7 @@ export class Renderer {
   ): void {
     const { ctx } = this;
     const { track, now } = state;
+    const palette = track.circuit.palette;
 
     ctx.save();
     ctx.beginPath();
@@ -156,10 +179,10 @@ export class Renderer {
 
     // Sky
     const sky = ctx.createLinearGradient(0, vp.y, 0, horizonY + vp.h * 0.1);
-    sky.addColorStop(0, SKY_TOP);
-    sky.addColorStop(0.62, "#1b2a4a");
-    sky.addColorStop(0.9, "#45496f");
-    sky.addColorStop(1, SKY_HORIZON);
+    sky.addColorStop(0, palette.top);
+    sky.addColorStop(0.62, palette.mid);
+    sky.addColorStop(0.9, palette.low);
+    sky.addColorStop(1, palette.horizon);
     ctx.fillStyle = sky;
     ctx.fillRect(vp.x, vp.y, vp.w, vp.h);
 
@@ -191,7 +214,7 @@ export class Renderer {
       offset += delta;
     }
 
-    // Bucket sprites (traffic + other players' cars) by segment for painter order.
+    // Bucket sprites (traffic, pickups, other players) by segment for painter order.
     const buckets = new Map<number, Array<() => void>>();
     const addSprite = (d: number, fn: () => void) => {
       const n = Math.floor(d / SEG_LEN) - baseSeg;
@@ -203,6 +226,13 @@ export class Renderer {
 
     for (const t of state.traffic) {
       addSprite(t.d, () => this.drawWorldCar(vp, cam, rows, focal, horizonY, camY, state, t.d, t.x, t.width, t.truck ? 0.95 : 0.62, t.color, { blinkDir: t.blinkDir, blinkOn: t.blinkUntil > now || t.targetX !== t.x, now }));
+    }
+    if (owner) {
+      const bit = 1 << owner.index;
+      for (const p of state.pickups) {
+        if (p.takenBy & bit) continue;
+        addSprite(p.d, () => this.drawPickup(vp, cam, rows, focal, horizonY, camY, state, p));
+      }
     }
     for (const p of state.players) {
       if (p === owner) continue;
@@ -223,13 +253,14 @@ export class Renderer {
       if (sprites) for (const fn of sprites) fn();
       const near = rows[n];
       const far = rows[n + 1];
-      if (near && far) this.drawRoadSlice(vp, near, far, baseSeg + n, n);
+      if (near && far) this.drawRoadSlice(vp, near, far, baseSeg + n, n, state);
     }
     const nearSprites = buckets.get(0);
     if (nearSprites) for (const fn of nearSprites) fn();
 
     if (owner) {
       this.drawOwnCar(vp, owner, focal, horizonY, camY, state.track, now);
+      if (owner.copGap !== null) this.drawCopPressure(vp, owner, now);
       this.drawPaneHud(vp, owner, state);
     }
 
@@ -244,8 +275,17 @@ export class Renderer {
     return track.segments[Math.max(0, Math.min(track.segments.length - 1, i))].elev;
   }
 
-  private drawRoadSlice(vp: Viewport, near: Row, far: Row, segIdx: number, n: number): void {
+  private drawRoadSlice(
+    vp: Viewport,
+    near: Row,
+    far: Row,
+    segIdx: number,
+    n: number,
+    state: RenderState,
+  ): void {
     const { ctx } = this;
+    const { track } = state;
+    const fogColor = track.circuit.palette.fog;
     const yTop = Math.min(far.y, near.y);
     const light = segIdx % 2 === 0;
 
@@ -264,10 +304,18 @@ export class Renderer {
     this.trapezoid(near.cx - near.halfW - rumbleN / 2, near.y, rumbleN / 2, far.cx - far.halfW - rumbleF / 2, far.y, rumbleF / 2);
     this.trapezoid(near.cx + near.halfW + rumbleN / 2, near.y, rumbleN / 2, far.cx + far.halfW + rumbleF / 2, far.y, rumbleF / 2);
 
-    // Finish line: checkered band across two segments at the line.
     const segStart = segIdx * SEG_LEN;
-    if (segStart >= RACE_LENGTH - SEG_LEN && segStart < RACE_LENGTH + SEG_LEN) {
-      this.checkerSlice(near, far);
+    const isCheckpoint =
+      track.circuit.special === "endless" &&
+      segStart > 0 &&
+      segStart < track.raceLength &&
+      segStart % ENDLESS_CHECKPOINT_EVERY < SEG_LEN * 2;
+
+    // Finish line: checkered band across two segments at the line.
+    if (segStart >= track.raceLength - SEG_LEN && segStart < track.raceLength + SEG_LEN) {
+      this.checkerSlice(near, far, "#f0f6fc", "#14161c");
+    } else if (isCheckpoint) {
+      this.checkerSlice(near, far, "#4dd0e1", "#0d3a44");
     } else if (light) {
       // Dashed lane guides at thirds — cosmetic; traffic ignores lanes.
       ctx.fillStyle = "rgba(255,255,255,0.42)";
@@ -281,7 +329,7 @@ export class Renderer {
     // Fog toward the horizon.
     const fog = (n / DRAW_SEGMENTS) ** 2 * 0.72;
     if (fog > 0.02) {
-      ctx.fillStyle = `rgba(${FOG.r},${FOG.g},${FOG.b},${fog})`;
+      ctx.fillStyle = `rgba(${fogColor.r},${fogColor.g},${fogColor.b},${fog})`;
       ctx.fillRect(vp.x, yTop, vp.w, Math.max(0.5, near.y - yTop + 0.5));
     }
   }
@@ -297,13 +345,13 @@ export class Renderer {
     ctx.fill();
   }
 
-  private checkerSlice(near: Row, far: Row): void {
+  private checkerSlice(near: Row, far: Row, a: string, b: string): void {
     const { ctx } = this;
     const cells = 8;
     for (let c = 0; c < cells; c++) {
       const f0 = -1 + (2 * c) / cells;
       const f1 = -1 + (2 * (c + 1)) / cells;
-      ctx.fillStyle = c % 2 === 0 ? "#f0f6fc" : "#14161c";
+      ctx.fillStyle = c % 2 === 0 ? a : b;
       ctx.beginPath();
       ctx.moveTo(near.cx + near.halfW * f0, near.y);
       ctx.lineTo(near.cx + near.halfW * f1, near.y);
@@ -315,8 +363,34 @@ export class Renderer {
   }
 
   /* ---------------------------------------------------------------- */
-  /* Car sprites                                                       */
+  /* Sprites                                                           */
   /* ---------------------------------------------------------------- */
+
+  /** Project a world (d, x) onto this pane. Returns null when off-range. */
+  private project(
+    vp: Viewport,
+    cam: { d: number; x: number },
+    rows: (Row | null)[],
+    focal: number,
+    horizonY: number,
+    camY: number,
+    track: Track,
+    d: number,
+    x: number,
+  ): { cx: number; baseY: number; scale: number } | null {
+    const dz = d - cam.d;
+    if (dz < NEAR_PLANE + 1 || dz > DRAW_SEGMENTS * SEG_LEN) return null;
+    const n = Math.floor(d / SEG_LEN) - Math.floor(cam.d / SEG_LEN);
+    const rowA = rows[Math.max(0, Math.min(rows.length - 1, n))];
+    const rowB = rows[Math.max(0, Math.min(rows.length - 1, n + 1))];
+    const roadOffset = rowA && rowB ? rowA.offset + (rowB.offset - rowA.offset) * ((d % SEG_LEN) / SEG_LEN) : rowA?.offset ?? rowB?.offset ?? 0;
+    const scale = focal / dz;
+    return {
+      cx: vp.x + vp.w / 2 + (roadOffset + x - cam.x) * scale,
+      baseY: horizonY + (camY - elevAt(track, d)) * scale,
+      scale,
+    };
+  }
 
   /** Draw a car somewhere out on the track (traffic or another player). */
   private drawWorldCar(
@@ -341,22 +415,12 @@ export class Renderer {
       now: number;
     },
   ): void {
-    const dz = d - cam.d;
-    if (dz < NEAR_PLANE + 1 || dz > DRAW_SEGMENTS * SEG_LEN) return;
-
-    // Road-center offset at this distance, interpolated between rows.
-    const n = Math.floor(d / SEG_LEN) - Math.floor(cam.d / SEG_LEN);
-    const rowA = rows[Math.max(0, Math.min(rows.length - 1, n))];
-    const rowB = rows[Math.max(0, Math.min(rows.length - 1, n + 1))];
-    const roadOffset = rowA && rowB ? rowA.offset + (rowB.offset - rowA.offset) * ((d % SEG_LEN) / SEG_LEN) : rowA?.offset ?? rowB?.offset ?? 0;
-
-    const scale = focal / dz;
-    const cx = vp.x + vp.w / 2 + (roadOffset + x - cam.x) * scale;
-    const baseY = horizonY + (camY - elevAt(state.track, d)) * scale;
-    const w = widthM * scale;
+    const pos = this.project(vp, cam, rows, focal, horizonY, camY, state.track, d, x);
+    if (!pos) return;
+    const w = widthM * pos.scale;
     if (w < 2) return;
 
-    this.carSprite(cx, baseY, w, aspect, color, {
+    this.carSprite(pos.cx, pos.baseY, w, aspect, color, {
       alpha: opts.ghost ? 0.35 : 1,
       nitro: opts.nitro ?? false,
       blink: opts.blinkOn && opts.blinkDir ? (Math.floor(opts.now / 180) % 2 === 0 ? opts.blinkDir : 0) : 0,
@@ -368,8 +432,61 @@ export class Renderer {
       ctx.font = `600 ${Math.max(11, Math.min(15, w * 0.16))}px system-ui, sans-serif`;
       ctx.textAlign = "center";
       ctx.fillStyle = "#fff";
-      ctx.fillText(opts.label, cx, baseY - w * aspect - w * 0.34 - 4);
+      ctx.fillText(opts.label, pos.cx, pos.baseY - w * aspect - w * 0.34 - 4);
       ctx.globalAlpha = 1;
+    }
+  }
+
+  /** Coins bob and glint; boost canisters pulse. Same procedural style as cars. */
+  private drawPickup(
+    vp: Viewport,
+    cam: { d: number; x: number },
+    rows: (Row | null)[],
+    focal: number,
+    horizonY: number,
+    camY: number,
+    state: RenderState,
+    pickup: Pickup,
+  ): void {
+    const pos = this.project(vp, cam, rows, focal, horizonY, camY, state.track, pickup.d, pickup.x);
+    if (!pos) return;
+    const { ctx } = this;
+    const size = 1.1 * pos.scale;
+    if (size < 2.5) return;
+
+    if (pickup.kind === "coin") {
+      const bob = Math.sin(state.now / 260 + pickup.d * 0.7) * size * 0.14;
+      const cy = pos.baseY - size * 0.75 + bob;
+      ctx.fillStyle = "rgba(0,0,0,0.3)";
+      ctx.beginPath();
+      ctx.ellipse(pos.cx, pos.baseY, size * 0.32, Math.max(1, size * 0.08), 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#ffd042";
+      ctx.beginPath();
+      ctx.arc(pos.cx, cy, size * 0.42, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "#a3720a";
+      ctx.lineWidth = Math.max(1, size * 0.09);
+      ctx.beginPath();
+      ctx.arc(pos.cx, cy, size * 0.26, 0, Math.PI * 2);
+      ctx.stroke();
+    } else {
+      const pulse = 0.85 + Math.sin(state.now / 180) * 0.15;
+      const w = size * 0.62;
+      const h = size * 1.05;
+      const cy = pos.baseY - h;
+      ctx.globalAlpha = 0.35 * pulse;
+      ctx.fillStyle = "#ffa657";
+      ctx.beginPath();
+      ctx.arc(pos.cx, cy + h * 0.5, size * 0.85, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "#ff7a1a";
+      this.roundRect(pos.cx - w / 2, cy, w, h, w * 0.3);
+      ctx.fill();
+      ctx.fillStyle = "#ffd042";
+      this.roundRect(pos.cx - w * 0.18, cy + h * 0.18, w * 0.36, h * 0.4, w * 0.12);
+      ctx.fill();
     }
   }
 
@@ -451,6 +568,52 @@ export class Renderer {
     ctx.restore();
   }
 
+  /** Red/blue urgency the closer the cop gets; the bar is the whole "cop". */
+  private drawCopPressure(vp: Viewport, owner: RenderPlayer, now: number): void {
+    const { ctx } = this;
+    const gap = owner.copGap!;
+    const danger = Math.max(0, Math.min(1, 1 - gap / 45)); // 0 safe → 1 busted
+
+    if (danger > 0.15 && !owner.finished) {
+      // Strobing edge vignette.
+      const phase = Math.floor(now / 220) % 2 === 0;
+      const strength = 0.12 + danger * 0.3;
+      const glow = ctx.createLinearGradient(0, vp.y, 0, vp.y + vp.h);
+      const color = phase ? `rgba(255,60,70,${strength})` : `rgba(70,110,255,${strength})`;
+      glow.addColorStop(0, color);
+      glow.addColorStop(0.35, "rgba(0,0,0,0)");
+      glow.addColorStop(0.65, "rgba(0,0,0,0)");
+      glow.addColorStop(1, color);
+      ctx.fillStyle = glow;
+      ctx.fillRect(vp.x, vp.y, vp.w, vp.h);
+    }
+
+    // Gap bar bottom-center.
+    const w = Math.min(180, vp.w * 0.3);
+    const x = vp.x + (vp.w - w) / 2;
+    const y = vp.y + vp.h - 22;
+    ctx.fillStyle = "rgba(10,12,16,0.72)";
+    this.roundRect(x - 8, y - 16, w + 16, 30, 8);
+    ctx.fill();
+    ctx.font = "800 10px system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillStyle = Math.floor(now / 220) % 2 === 0 ? "#ff5a5f" : "#7aa2ff";
+    ctx.fillText("POLICE", x, y - 5);
+    ctx.fillStyle = "rgba(255,255,255,0.15)";
+    this.roundRect(x, y, w, 7, 3.5);
+    ctx.fill();
+    ctx.fillStyle = danger > 0.6 ? "#ff5a5f" : danger > 0.3 ? "#ffd042" : "#7ee787";
+    this.roundRect(x, y, w * Math.max(0.02, Math.min(1, gap / 90)), 7, 3.5);
+    ctx.fill();
+
+    if (owner.busted) {
+      ctx.textAlign = "center";
+      ctx.font = "800 34px system-ui, sans-serif";
+      ctx.fillStyle = Math.floor(now / 220) % 2 === 0 ? "#ff5a5f" : "#7aa2ff";
+      ctx.fillText("BUSTED", vp.x + vp.w / 2, vp.y + vp.h * 0.3);
+    }
+  }
+
   /* ---------------------------------------------------------------- */
   /* HUD                                                               */
   /* ---------------------------------------------------------------- */
@@ -475,22 +638,20 @@ export class Renderer {
     ctx.fillStyle = "rgba(255,255,255,0.9)";
     ctx.fillText(`${Math.round(owner.car.speed * 3.6)} km/h`, vp.x + vp.w - pad, vp.y + vp.h - pad);
 
-    // Nitro bar
-    const nw = Math.min(140, vp.w * 0.2);
-    const nx = vp.x + pad;
-    const ny = vp.y + vp.h - pad - 8;
-    const ready = state.now >= owner.car.nitroReadyAt;
-    const frac = ready ? 1 : Math.max(0, Math.min(1, 1 - (owner.car.nitroReadyAt - state.now) / NITRO_COOLDOWN_MS));
-    ctx.fillStyle = "rgba(255,255,255,0.15)";
-    this.roundRect(nx, ny, nw, 8, 4);
-    ctx.fill();
-    ctx.fillStyle = ready ? "#7ee787" : "#8b95a5";
-    this.roundRect(nx, ny, nw * frac, 8, 4);
-    ctx.fill();
-    ctx.textAlign = "left";
-    ctx.font = "600 10px system-ui, sans-serif";
-    ctx.fillStyle = "rgba(255,255,255,0.65)";
-    ctx.fillText(ready ? "NITRO READY — press A" : "NITRO", nx, ny - 5);
+    // Coins
+    if (owner.car.coins > 0) {
+      const cy = vp.y + vp.h - pad - 24;
+      ctx.fillStyle = "#ffd042";
+      ctx.beginPath();
+      ctx.arc(vp.x + vp.w - pad - 38, cy - 4, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "rgba(255,255,255,0.9)";
+      ctx.font = "700 14px system-ui, sans-serif";
+      ctx.fillText(`${owner.car.coins}`, vp.x + vp.w - pad, cy);
+    }
+
+    if (owner.car.gearing) this.drawTach(vp, owner, state);
+    else this.drawNitroBar(vp, owner, state);
 
     // Gap chips for players not visible from this pane.
     let topChip = 0;
@@ -508,11 +669,82 @@ export class Renderer {
       }
     }
 
-    if (owner.finished) {
+    if (owner.finished && !owner.busted) {
       ctx.textAlign = "center";
       ctx.font = "800 34px system-ui, sans-serif";
       ctx.fillStyle = owner.color;
-      ctx.fillText(`FINISHED ${ord}`, vp.x + vp.w / 2, vp.y + vp.h * 0.3);
+      ctx.fillText(state.endless ? "TIME UP" : `FINISHED ${ord}`, vp.x + vp.w / 2, vp.y + vp.h * 0.3);
+    }
+  }
+
+  private drawNitroBar(vp: Viewport, owner: RenderPlayer, state: RenderState): void {
+    const { ctx } = this;
+    const pad = 12;
+    const nw = Math.min(140, vp.w * 0.2);
+    const nx = vp.x + pad;
+    const ny = vp.y + vp.h - pad - 8;
+    const ready = state.now >= owner.car.nitroReadyAt;
+    const frac = ready ? 1 : Math.max(0, Math.min(1, 1 - (owner.car.nitroReadyAt - state.now) / NITRO_COOLDOWN_MS));
+    ctx.fillStyle = "rgba(255,255,255,0.15)";
+    this.roundRect(nx, ny, nw, 8, 4);
+    ctx.fill();
+    ctx.fillStyle = ready ? "#7ee787" : "#8b95a5";
+    this.roundRect(nx, ny, nw * frac, 8, 4);
+    ctx.fill();
+    ctx.textAlign = "left";
+    ctx.font = "600 10px system-ui, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.65)";
+    ctx.fillText(ready ? "NITRO READY — press A" : "NITRO", nx, ny - 5);
+  }
+
+  /** Grand Prix: rpm bar with the perfect-shift window marked + gear digit. */
+  private drawTach(vp: Viewport, owner: RenderPlayer, state: RenderState): void {
+    const { ctx } = this;
+    const g = owner.car.gearing!;
+    const pad = 12;
+    const tw = Math.min(170, vp.w * 0.26);
+    const tx = vp.x + pad + 34;
+    const ty = vp.y + vp.h - pad - 12;
+    const rpm = owner.rpm;
+
+    // Gear digit
+    ctx.textAlign = "left";
+    ctx.font = "800 30px system-ui, sans-serif";
+    ctx.fillStyle = state.now < g.perfectUntil ? "#7ee787" : "rgba(255,255,255,0.92)";
+    ctx.fillText(`${g.gear}`, vp.x + pad, ty + 12);
+    ctx.font = "600 9px system-ui, sans-serif";
+    ctx.fillStyle = "rgba(255,255,255,0.55)";
+    ctx.fillText(g.auto ? "AUTO" : "GEAR", vp.x + pad, ty - 20);
+
+    // rpm bar
+    ctx.fillStyle = "rgba(255,255,255,0.15)";
+    this.roundRect(tx, ty, tw, 12, 5);
+    ctx.fill();
+    // Perfect window
+    ctx.fillStyle = "rgba(126,231,135,0.28)";
+    this.roundRect(tx + tw * PERFECT_RPM, ty, tw * (1 - PERFECT_RPM), 12, 5);
+    ctx.fill();
+    // Needle fill
+    const hot = rpm >= PERFECT_RPM;
+    ctx.fillStyle = rpm > 0.985 ? "#ff5a5f" : hot ? "#7ee787" : "#7aa2ff";
+    this.roundRect(tx, ty, tw * rpm, 12, 5);
+    ctx.fill();
+
+    // Shift verdict flash
+    const sinceShift = state.now - g.shiftedAt;
+    if (g.lastShift && sinceShift < 900 && !g.auto) {
+      const label =
+        g.lastShift === "perfect" ? "PERFECT SHIFT!" :
+        g.lastShift === "bog" ? "TOO EARLY" :
+        g.lastShift === "overrev" ? "OVER-REV!" : null;
+      if (label) {
+        ctx.textAlign = "left";
+        ctx.font = "800 13px system-ui, sans-serif";
+        ctx.globalAlpha = Math.max(0, 1 - sinceShift / 900);
+        ctx.fillStyle = g.lastShift === "perfect" ? "#7ee787" : "#ff5a5f";
+        ctx.fillText(label, tx, ty - 6 - sinceShift * 0.012);
+        ctx.globalAlpha = 1;
+      }
     }
   }
 
@@ -548,7 +780,13 @@ export class Renderer {
       ctx.fillText(p.name, vp.x + 84, y);
       ctx.fillStyle = "rgba(255,255,255,0.5)";
       ctx.font = "600 13px system-ui, sans-serif";
-      const detail = p.finished ? "finished" : `${Math.max(0, Math.round(RACE_LENGTH - p.car.d))}m to go`;
+      const detail = p.busted
+        ? "busted"
+        : p.finished
+          ? "finished"
+          : state.endless
+            ? `${Math.round(p.car.d)}m`
+            : `${Math.max(0, Math.round(state.track.raceLength - p.car.d))}m to go`;
       ctx.fillText(detail, vp.x + vp.w - 28 - ctx.measureText(detail).width, y);
     });
   }
@@ -570,11 +808,37 @@ export class Renderer {
     ctx.fillRect(x + w - 1, y - 4, 2, 13);
 
     for (const p of state.players) {
-      const frac = Math.max(0, Math.min(1, p.car.d / RACE_LENGTH));
+      const frac = Math.max(0, Math.min(1, p.car.d / state.track.raceLength));
       ctx.fillStyle = p.color;
       ctx.beginPath();
       ctx.arc(x + w * frac, y + 2.5, 5, 0, Math.PI * 2);
       ctx.fill();
+    }
+  }
+
+  /** Endless Rush: the shared countdown clock owns the top of the screen. */
+  private drawEndlessClock(state: RenderState): void {
+    const { ctx, cssW } = this;
+    const endless = state.endless!;
+    const x = cssW / 2;
+    const urgent = endless.leftS < 10;
+
+    ctx.fillStyle = "rgba(10,12,16,0.78)";
+    this.roundRect(x - 64, 6, 128, 34, 10);
+    ctx.fill();
+    ctx.textAlign = "center";
+    ctx.font = "800 22px system-ui, sans-serif";
+    ctx.fillStyle = urgent && Math.floor(state.now / 300) % 2 === 0 ? "#ff5a5f" : "#f0f6fc";
+    const s = Math.ceil(endless.leftS);
+    ctx.fillText(`${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`, x, 31);
+
+    if (state.now < endless.flashUntil) {
+      const alpha = Math.max(0, (endless.flashUntil - state.now) / 1400);
+      ctx.globalAlpha = alpha;
+      ctx.font = "800 18px system-ui, sans-serif";
+      ctx.fillStyle = "#4dd0e1";
+      ctx.fillText(`CHECKPOINT +${endless.bonusS}s`, x, 62);
+      ctx.globalAlpha = 1;
     }
   }
 
