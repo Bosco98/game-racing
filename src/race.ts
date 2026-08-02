@@ -180,6 +180,20 @@ export class RacingGame {
       }),
     );
 
+    // The deck is usually driven from a phone, but the menu must also work
+    // from the machine itself — for setup, and for anyone whose controller
+    // can't steer (no motion sensor, permission denied).
+    const onKey = (event: KeyboardEvent) => {
+      if (!this.inMenu) return;
+      if (event.key === "ArrowRight") this.cycleCircuit(1);
+      else if (event.key === "ArrowLeft") this.cycleCircuit(-1);
+      else if (event.key === "m" || event.key === "M") this.toggleMode();
+      else return;
+      event.preventDefault();
+    };
+    addEventListener("keydown", onKey);
+    this.unsubscribes.push(() => removeEventListener("keydown", onKey));
+
     this.last = performance.now();
     this.rafId = requestAnimationFrame((now) => this.loop(now));
   }
@@ -291,8 +305,8 @@ export class RacingGame {
   /* Lobby menu                                                        */
   /* ---------------------------------------------------------------- */
 
-  private cycleCircuit(): void {
-    this.circuitIndex = (this.circuitIndex + 1) % CIRCUITS.length;
+  private cycleCircuit(step = 1): void {
+    this.circuitIndex = (this.circuitIndex + step + CIRCUITS.length) % CIRCUITS.length;
     this.track = generateTrack(this.circuit);
     this.traffic = spawnTraffic(this.track.traffic);
     this.pickups = spawnPickups(this.track.pickups);

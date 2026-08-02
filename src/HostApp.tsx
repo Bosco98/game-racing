@@ -110,6 +110,7 @@ export function HostApp() {
                       <span><b>P1 GAS</b> next circuit</span>
                       <span><b>P1 BRAKE</b> mode</span>
                       {gp && <span><b>B</b> auto/manual</span>}
+                      <span className="keys"><b>← →</b> circuit · <b>M</b> mode (keyboard)</span>
                     </div>
                     <div className="room-line">
                       Room <b>{code}</b> · {joinUrl?.replace(/^https?:\/\//, "")}
