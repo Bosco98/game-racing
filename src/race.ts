@@ -225,7 +225,9 @@ export class RacingGame {
       spectator: this.phase === "racing" || this.phase === "countdown",
       place: this.racers.size + 1,
       finishMs: null,
-      manual: false,
+      // Grand Prix exists for the gearbox: default to it, so picking the mode
+      // visibly changes something. B opts out to the auto box.
+      manual: true,
       busted: false,
       copGap: COP_START_GAP,
     };
