@@ -106,11 +106,12 @@ export function HostApp() {
                       ))}
                     </ul>
                     <div className="legend">
-                      <span><b>A</b> ready</span>
-                      <span><b>P1 GAS</b> next circuit</span>
-                      <span><b>P1 BRAKE</b> mode</span>
-                      {gp && <span><b>B</b> auto/manual</span>}
-                      <span className="keys"><b>← →</b> circuit · <b>M</b> mode (keyboard)</span>
+                      <span><kbd>A</kbd> Ready / unready</span>
+                      <span><kbd>GAS</kbd> P1: next circuit</span>
+                      <span><kbd>BRAKE</kbd> P1: Cruise / Grand Prix</span>
+                      {gp && <span><kbd>B</kbd> Auto / manual gearbox</span>}
+                      {gp && <span className="gear-help"><kbd>1–4</kbd> During the race: tap a gear on your phone</span>}
+                      <span className="keys">Keyboard: <kbd>←</kbd><kbd>→</kbd> circuit · <kbd>M</kbd> mode</span>
                     </div>
                     <div className="room-line">
                       Room <b>{code}</b> · {joinUrl?.replace(/^https?:\/\//, "")}
@@ -171,7 +172,7 @@ export function HostApp() {
                 ))}
             </ol>
             <div className="hint">
-              Press A for a rematch · P1: GAS next circuit, BRAKE switch mode{gp ? " · B auto/manual" : ""}
+              Tap <b>A</b> for a rematch. P1 uses <b>GAS</b> for the next circuit and <b>BRAKE</b> to switch mode{gp ? ". Tap B for auto / manual" : ""}.
             </div>
           </div>
         </div>
